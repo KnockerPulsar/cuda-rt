@@ -1,7 +1,10 @@
 #include <iostream>
 
 __global__ void add(int n, float *x, float *y) {
-  for (int i = 0; i < n; i++)
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
+
+  for (int i = index; i < n; i += stride)
     y[i] = x[i] + y[i];
 }
 
@@ -18,7 +21,11 @@ int main(void) {
   }
 
   std::cout << "Launching kernel\n";
-  add<<<1,1>>>(N, x, y);
+
+  int blockSize = 256;
+  //                 v----------v this part is for rounding up
+  int numBlocks = (N + blockSize - 1) / blockSize;
+  add<<<numBlocks, blockSize>>>(N, x, y);
 
   cudaDeviceSynchronize();
 
