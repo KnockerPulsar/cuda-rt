@@ -72,7 +72,7 @@ __global__ void free_world(hitable** d_list, hitable** d_world){
 
 int main(void) {
 
-  int tx = 8, ty = 8;
+  int tx = 32, ty = 32;
   int nx = 1920, ny = 1080;
 
   int num_pixels = nx * ny;
