@@ -20,6 +20,18 @@ void check_cuda(cudaError_t result, char const *const func,
   }
 }
 
+#define RANDVEC3                                                               \
+  vec3(curand_uniform(local_rand_state), curand_uniform(local_rand_state),     \
+       curand_uniform(local_rand_state))
+
+__device__ vec3 random_in_unit_sphere(curandState *local_rand_state) {
+  vec3 p;
+  do {
+    p = 2.0f * RANDVEC3 - vec3(1, 1, 1);
+  } while (p.squared_length() >= 1.0f);
+  return p;
+}
+
 __device__ bool hit_sphere(const vec3 &center, float radius, const ray &r) {
   vec3 oc = r.origin() - center;
   float a = dot(r.direction(), r.direction());
@@ -29,20 +41,31 @@ __device__ bool hit_sphere(const vec3 &center, float radius, const ray &r) {
   return (discriminant > 0.0f);
 }
 
-__device__ vec3 color(const ray &r, hitable **world) {
-  hit_record rec;
-  if ((*world)->hit(r, 0.0, FLT_MAX, rec))
-    return 0.5f * vec3(rec.normal.x() + 1.0f, rec.normal.y() + 1.0f,
-                       rec.normal.z() + 1.0f);
-  else {
-    vec3 unit_direction = unit_vector(r.direction());
-    float t = 0.5f * (unit_direction.y() + 1.0f);
-    return (1.0f - t) * vec3(1.0, 1.0, 1.0) + t * vec3(0.5, 0.7, 1.0);
+__device__ vec3 color(const ray &r, hitable **world,
+                      curandState *local_rand_state) {
+  ray cur_ray = r;
+  float cur_attenuation = 1.0f;
+
+  // 50 is the recursion limit
+  for (int i = 0; i < 50; i++) {
+    hit_record rec;
+    if ((*world)->hit(cur_ray, 0.001f, FLT_MAX, rec)) {
+      vec3 target =
+          rec.p + rec.normal + random_in_unit_sphere(local_rand_state);
+      cur_attenuation *= 0.5f;
+      cur_ray = ray(rec.p, target - rec.p);
+    } else {
+      vec3 unit_direction = unit_vector(cur_ray.direction());
+      float t = 0.5f * (unit_direction.y() + 1.0f);
+      vec3 c = (1.0f - t) * vec3(1.0, 1.0, 1.0) + t * vec3(0.5, 0.7, 1.0);
+      return cur_attenuation * c;
+    }
   }
+  return vec3(0.0, 0.0, 0.0);
 }
 
-__global__ void render(vec3 *fb, int max_x, int max_y, int ns,
-                       camera **cam, hitable **world, curandState *rand_state) {
+__global__ void render(vec3 *fb, int max_x, int max_y, int ns, camera **cam,
+                       hitable **world, curandState *rand_state) {
   int i = threadIdx.x + blockIdx.x * blockDim.x;
   int j = threadIdx.y + blockIdx.y * blockDim.y;
 
@@ -54,17 +77,18 @@ __global__ void render(vec3 *fb, int max_x, int max_y, int ns,
   curandState local_rand_state = rand_state[pixel_index];
   vec3 col(0, 0, 0);
 
-  for (int s = 0; s < ns ; s++) {
+  for (int s = 0; s < ns; s++) {
     float u = float(i + curand_uniform(&local_rand_state)) / float(max_x);
     float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
     ray r = (*cam)->get_ray(u, v);
-    col += color(r, world);
+    col += color(r, world, &local_rand_state);
   }
 
   fb[pixel_index] = col / float(ns);
 }
 
-__global__ void create_world(hitable **d_list, hitable **d_world, camera** d_camera) {
+__global__ void create_world(hitable **d_list, hitable **d_world,
+                             camera **d_camera) {
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     d_list[0] = new sphere(vec3(0, 0, -1), 0.5);
     d_list[1] = new sphere(vec3(0, -100.5, -1), 100);
@@ -95,7 +119,7 @@ __global__ void render_init(int max_x, int max_y, curandState *rand_state) {
 int main(void) {
 
   int tx = 32, ty = 32;
-  int nx = 1920, ny = 1080, ns = 100;
+  int nx = 1200, ny = 600, ns = 1000;
 
   int num_pixels = nx * ny;
   size_t fb_size = num_pixels * sizeof(vec3);
