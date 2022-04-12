@@ -1,10 +1,12 @@
+#include "camera.h"
 #include "hitable.h"
 #include "hitable_list.h"
 #include "ray.h"
 #include "sphere.h"
 #include "vec3.h"
-#include <iostream>
+#include <curand_kernel.h>
 #include <float.h>
+#include <iostream>
 
 #define checkCudaErrors(val) check_cuda((val), #val, __FILE__, __LINE__)
 void check_cuda(cudaError_t result, char const *const func,
@@ -27,7 +29,7 @@ __device__ bool hit_sphere(const vec3 &center, float radius, const ray &r) {
   return (discriminant > 0.0f);
 }
 
-__device__ vec3 color(const ray &r, hitable** world) {
+__device__ vec3 color(const ray &r, hitable **world) {
   hit_record rec;
   if ((*world)->hit(r, 0.0, FLT_MAX, rec))
     return 0.5f * vec3(rec.normal.x() + 1.0f, rec.normal.y() + 1.0f,
@@ -39,9 +41,8 @@ __device__ vec3 color(const ray &r, hitable** world) {
   }
 }
 
-__global__ void render(vec3 *fb, int max_x, int max_y, vec3 lower_left_corner,
-                       vec3 horizontal, vec3 vertical, vec3 origin,
-                       hitable **world) {
+__global__ void render(vec3 *fb, int max_x, int max_y, int ns,
+                       camera **cam, hitable **world, curandState *rand_state) {
   int i = threadIdx.x + blockIdx.x * blockDim.x;
   int j = threadIdx.y + blockIdx.y * blockDim.y;
 
@@ -49,31 +50,52 @@ __global__ void render(vec3 *fb, int max_x, int max_y, vec3 lower_left_corner,
     return;
 
   int pixel_index = j * max_x + i;
-  float u = float(i) / float(max_x);
-  float v = float(j) / float(max_y);
-  ray r(origin, lower_left_corner + u * horizontal + v * vertical);
 
-  fb[pixel_index] = color(r, world);
+  curandState local_rand_state = rand_state[pixel_index];
+  vec3 col(0, 0, 0);
+
+  for (int s = 0; s < ns ; s++) {
+    float u = float(i + curand_uniform(&local_rand_state)) / float(max_x);
+    float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
+    ray r = (*cam)->get_ray(u, v);
+    col += color(r, world);
+  }
+
+  fb[pixel_index] = col / float(ns);
 }
 
-__global__ void create_world(hitable **d_list, hitable **d_world) {
+__global__ void create_world(hitable **d_list, hitable **d_world, camera** d_camera) {
   if (threadIdx.x == 0 && blockIdx.x == 0) {
     d_list[0] = new sphere(vec3(0, 0, -1), 0.5);
     d_list[1] = new sphere(vec3(0, -100.5, -1), 100);
     *d_world = new hitable_list(d_list, 2);
+    *d_camera = new camera();
   }
 }
 
-__global__ void free_world(hitable** d_list, hitable** d_world){
+__global__ void free_world(hitable **d_list, hitable **d_world,
+                           camera **d_camera) {
   delete *(d_list);
-  delete *(d_list+1);
+  delete *(d_list + 1);
   delete *d_world;
+  delete *d_camera;
+}
+
+__global__ void render_init(int max_x, int max_y, curandState *rand_state) {
+  int i = threadIdx.x + blockIdx.x * blockDim.x;
+  int j = threadIdx.y + blockIdx.y * blockDim.y;
+
+  if (i >= max_x || j >= max_y)
+    return;
+
+  int pixel_index = j * max_x + i;
+  curand_init(1984, pixel_index, 0, &rand_state[pixel_index]);
 }
 
 int main(void) {
 
   int tx = 32, ty = 32;
-  int nx = 1920, ny = 1080;
+  int nx = 1920, ny = 1080, ns = 100;
 
   int num_pixels = nx * ny;
   size_t fb_size = num_pixels * sizeof(vec3);
@@ -90,22 +112,30 @@ int main(void) {
   hitable **d_world;
   checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable *)));
 
-  create_world<<<1, 1>>>(d_list, d_world);
+  camera **d_camera;
+  checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
+
+  curandState *d_rand_state;
+  checkCudaErrors(
+      cudaMalloc((void **)&d_rand_state, num_pixels * sizeof(curandState)));
+
+  create_world<<<1, 1>>>(d_list, d_world, d_camera);
+  render_init<<<blocks, threads>>>(nx, ny, d_rand_state);
 
   checkCudaErrors(cudaGetLastError());
   checkCudaErrors(cudaDeviceSynchronize());
 
-  render<<<blocks, threads>>>(fb, nx, ny, vec3(-2.0, -1.0, -1.0),
-                              vec3(4.0, 0.0, 0.0), vec3(0.0, 2.0, 0.0),
-                              vec3(0.0, 0.0, 0.0), d_world);
+  render<<<blocks, threads>>>(fb, nx, ny, ns, d_camera, d_world, d_rand_state);
 
   checkCudaErrors(cudaGetLastError());
   checkCudaErrors(cudaDeviceSynchronize());
-  
-  free_world<<<1,1>>>(d_list, d_world);
+
+  free_world<<<1, 1>>>(d_list, d_world, d_camera);
   checkCudaErrors(cudaGetLastError());
   checkCudaErrors(cudaFree(d_list));
   checkCudaErrors(cudaFree(d_world));
+  checkCudaErrors(cudaFree(d_rand_state));
+  checkCudaErrors(cudaFree(d_camera));
 
   // Output FB as Image
   std::cout << "P3\n" << nx << " " << ny << "\n255\n";
